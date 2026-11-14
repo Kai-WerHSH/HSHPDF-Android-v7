@@ -1,7 +1,6 @@
 # HSHPDF para Android (nativo: Kotlin + Jetpack Compose + MuPDF)
 
 **Criador da fonte:** Henrique de Souza Henrique
-**Coautor e assistente de IA:** Claude (Anthropic)
 
 ## Versão 0.6 — correções
 - **Relatório de erro:** se o app fechar, na próxima abertura ele mostra o que aconteceu (botões Copiar/Compartilhar). Também em Ajustes > Problemas.
