@@ -1,5 +1,4 @@
 // Criador da fonte: Henrique de Souza Henrique
-// Coautor e assistente de IA: Claude (Anthropic)
 package com.hsh.meupdf
 
 import android.content.Context
@@ -175,7 +174,7 @@ fun CapaMiniatura(item: ItemPasta, modifier: Modifier = Modifier) {
         if (b != null) {
             Image(bitmap = b.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
         } else {
-            Ico(if (item.tipo == "epub") "livro" else "pasta", MaterialTheme.colorScheme.onSurfaceVariant, 26.dp)
+            Ico(if (item.ehPasta) "pasta" else "livro", MaterialTheme.colorScheme.onSurfaceVariant, 26.dp)
         }
     }
 }
