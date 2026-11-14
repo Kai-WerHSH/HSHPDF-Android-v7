@@ -1,5 +1,4 @@
 // Criador da fonte: Henrique de Souza Henrique
-// Coautor e assistente de IA: Claude (Anthropic)
 package com.hsh.meupdf
 
 import android.content.Context
@@ -31,7 +30,11 @@ import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.zip.ZipException
 import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.io.BufferedInputStream
+import java.lang.reflect.InvocationTargetException
 
 /** O MuPDF não é thread-safe: todo acesso a ele passa por esta única thread (com pilha grande). */
 object Trabalho {
@@ -396,8 +399,39 @@ class FonteImagens(private val entradas: List<Entrada>, private val zip: ZipFile
 
         fun deEntradas(l: List<Entrada>): FonteImagens = FonteImagens(l, null)
 
+        /** ZIP sem índice no final (download incompleto, arquivo cortado): lê entrada por entrada e aproveita as páginas que estiverem inteiras. */
+        fun deZipDanificado(arq: File): FonteImagens {
+            val dir = File(arq.parentFile, arq.name + "_zip").apply { mkdirs() }
+            val achados = ArrayList<Pair<String, File>>()
+            try {
+                ZipInputStream(BufferedInputStream(arq.inputStream(), 1 shl 16)).use { z ->
+                    while (true) {
+                        val e = z.nextEntry ?: break
+                        val nome = e.name
+                        if (e.isDirectory || !ehImagem(nome) || nome.contains("__MACOSX") || nome.substringAfterLast('/').startsWith(".")) continue
+                        val destino = File(dir, "%05d_%s".format(achados.size, nome.substringAfterLast('/')))
+                        try {
+                            destino.outputStream().use { z.copyTo(it) }
+                        } catch (x: IOException) {
+                            destino.delete()
+                            break
+                        }
+                        achados.add(Pair(nome, destino))
+                    }
+                }
+            } catch (e: IOException) { }
+            if (achados.isEmpty()) {
+                dir.deleteRecursively()
+                throw IOException("O arquivo está danificado ou incompleto (se veio do Telegram, confira se o download terminou) e não consegui recuperar nenhuma página.")
+            }
+            val ordenados = achados.sortedWith { a, b -> comparaNatural(a.first, b.first) }
+            val fonte = FonteImagens(ordenados.map { (n, f) -> Entrada(n) { f.inputStream() } }, null)
+            fonte.limpezas.add { dir.deleteRecursively() }
+            return fonte
+        }
+
         fun deZip(arq: File): FonteImagens {
-            val z = ZipFile(arq)
+            val z = try { ZipFile(arq) } catch (e: ZipException) { return deZipDanificado(arq) }
             val nomes = z.entries().asSequence()
                 .filter { !it.isDirectory }
                 .map { it.name }
@@ -421,13 +455,32 @@ class FonteImagens(private val entradas: List<Entrada>, private val zip: ZipFile
          * CBR (RAR): começa a ler assim que a 1ª imagem é extraída; o resto continua em segundo plano
          * (por isso abre na hora, mesmo em arquivos grandes). Tudo é apagado ao fechar.
          */
+        private fun mensagemRar(e: Throwable): String {
+            var c: Throwable = e
+            while (c is InvocationTargetException && c.cause != null) c = c.cause!!
+            val t = (c.message ?: "") + " " + c.javaClass.simpleName
+            return when {
+                t.contains("V5", true) || t.contains("RAR5", true) ->
+                    "Este CBR usa o formato RAR5 (o RAR novo), que o app ainda não consegue abrir."
+                t.contains("password", true) || t.contains("encrypt", true) -> "Este CBR tem senha e não pode ser aberto."
+                else -> "Não consegui abrir o CBR (${c.javaClass.simpleName}${if (c.message != null) ": " + c.message else ""})."
+            }
+        }
+
         fun deRar(arq: File): FonteImagens {
             val dir = File(arq.parentFile, arq.name + "_rar").apply { mkdirs() }
             val classe = try { Class.forName("com.github.junrar.Archive") } catch (e: Exception) {
                 throw IllegalStateException("Biblioteca de RAR não encontrada no app.")
             }
-            val arch = classe.getConstructor(File::class.java).newInstance(arq)
-            val cabs = (classe.getMethod("getFileHeaders").invoke(arch) as List<*>).filterNotNull()
+            val arch: Any
+            val cabs: List<Any>
+            try {
+                arch = classe.getConstructor(File::class.java).newInstance(arq)
+                cabs = (classe.getMethod("getFileHeaders").invoke(arch) as List<*>).filterNotNull()
+            } catch (e: InvocationTargetException) {
+                dir.deleteRecursively()
+                throw IllegalStateException(mensagemRar(e), e)
+            }
             val validos = cabs.filter { h ->
                 val dirFlag = try { h.javaClass.getMethod("isDirectory").invoke(h) as Boolean } catch (e: Exception) { false }
                 !dirFlag && ehImagem(nomeCabecalho(h)) && !nomeCabecalho(h).contains("__MACOSX")
@@ -538,8 +591,33 @@ object Abertura {
         Origem(destino, nome) { try { destino.delete() } catch (e: Exception) { } }
     }
 
+    /** Olha os primeiros bytes: "zip", "rar4", "rar5", "7z", "pdf" ou "outro". */
+    private fun tipoReal(arquivo: File): String {
+        val b = ByteArray(8)
+        val n = try { arquivo.inputStream().use { it.read(b) } } catch (e: Exception) { -1 }
+        if (n < 4) return "outro"
+        fun ini(vararg x: Int) = x.indices.all { (b[it].toInt() and 0xFF) == x[it] }
+        return when {
+            ini(0x50, 0x4B) -> "zip"
+            ini(0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01) -> "rar5"
+            ini(0x52, 0x61, 0x72, 0x21, 0x1A, 0x07) -> "rar4"
+            ini(0x37, 0x7A, 0xBC, 0xAF) -> "7z"
+            ini(0x25, 0x50, 0x44, 0x46) -> "pdf"
+            else -> "outro"
+        }
+    }
+
     suspend fun abrirArquivo(arquivo: File, nome: String): Fonte = withContext(Dispatchers.IO) {
         val ext = nome.substringAfterLast('.', "").lowercase()
+        if (ext in setOf("cbz", "zip", "cbr", "rar")) {
+            when (tipoReal(arquivo)) {
+                "zip" -> return@withContext FonteImagens.deZip(arquivo)
+                "rar4" -> return@withContext FonteImagens.deRar(arquivo)
+                "rar5" -> throw IllegalStateException("Este arquivo usa o formato RAR5 (o RAR novo), que o app ainda não consegue abrir. Abra no PC e salve como CBZ, ou peça o suporte a RAR5.")
+                "7z" -> throw IllegalStateException("Este arquivo é 7z (com extensão de quadrinho), formato que o app ainda não abre.")
+                "pdf" -> return@withContext withContext(Trabalho.mupdf) { FontePdf(arquivo.absolutePath) }
+            }
+        }
         when {
             ext in mupdfExts -> withContext(Trabalho.mupdf) { FontePdf(arquivo.absolutePath) }
             ext == "cbz" || ext == "zip" -> FonteImagens.deZip(arquivo)
